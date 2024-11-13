@@ -38,6 +38,7 @@ def find_max_pack_len_with_padding(
     dataset,
     samples_per_minibatch,
     num_gpus,
+    rank,
     avg_sample_len,
     seed,
 ):
@@ -70,8 +71,8 @@ def find_max_pack_len_with_padding(
         sampler = MultipackDistributedBatchSampler(
             batch_max_length=num_tokens_per_gpu,
             lengths=dataset.get_lengths(),
-            num_replicas=torch.distributed.get_world_size(),
-            rank=torch.distributed.get_rank(),
+            num_replicas=num_gpus,
+            rank=rank,
             seed=seed,
             padding=True,
         )
@@ -115,6 +116,7 @@ def find_max_pack_len_with_padding(
 
 def find_packing_max_batch_len_and_grad_accum(
     num_gpus,
+    rank,
     avg_sample_len,
     effective_batch_size,
     max_batch_len_per_gpu,
@@ -161,6 +163,7 @@ def find_packing_max_batch_len_and_grad_accum(
                 dataset,
                 samples_per_minibatch,
                 num_gpus,
+                rank,
                 avg_sample_len,
                 seed,
             )

@@ -628,6 +628,7 @@ def calculate_percard_packing_params(
     try:
         packing_max_batch_len, grad_accum = find_packing_max_batch_len_and_grad_accum(
             num_gpus=world_size,
+            rank=local_rank,
             avg_sample_len=dataset.get_lengths().mean(),
             effective_batch_size=effective_batch_size,
             max_batch_len_per_gpu=max_batch_len,
@@ -743,7 +744,7 @@ def check_hpu_compatible(
 
 def train_hpu(
     args,
-    model,
+    model: str,
     tokenizer,
     data_loader,
     grad_accum_steps,
@@ -830,7 +831,7 @@ def main(args):
         flash_enabled=flash_enabled,
         max_batch_len=args.max_batch_len,
         packing_max_batch_len=packing_max_batch_len,
-        samples_per_gpu=args.sampler_per_gpu,
+        samples_per_gpu=args.samples_per_gpu,
         seed=args.seed,
     )
     args.sampler = confirmed_sampler
@@ -871,9 +872,10 @@ def main(args):
         )
 
     else:
+        print("TRAINING ON HPU")
         train_hpu(
             args=args,
-            model=model,
+            model=args.model_name_or_path,
             tokenizer=tokenizer,
             data_loader=train_loader,
             grad_accum_steps=grad_accum,

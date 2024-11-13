@@ -12,6 +12,7 @@ import time
 
 # Third Party
 os.environ["PT_HPU_LAZY_MODE"] = "0"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import habana_frameworks.torch as htorch
 import habana_frameworks.torch.distributed.hccl
 
@@ -85,7 +86,9 @@ def setup_fsdp(model: torch.nn.Module, sharding_strategy: str, cpu_param_offload
         sharding_strategy=ShardingStrategy[sharding_strategy],
         device_id=torch.device("hpu", torch.hpu.current_device()),
         cpu_offload=CPUOffload(offload_params=cpu_param_offload),
+        use_orig_params=True,
     )
+
 
     return model
 
@@ -146,8 +149,8 @@ def batch_metric_log(
 
     elapsed_time = time.time() - start_time
     overall_throughput = args.samples_per_gpu * WORLD_SIZE / elapsed_time
-    # vmem_allocated = htorch.memory_allocated() / (1024**3)
-    # vmalloc_retries = htorch.memory_stats()["num_alloc_retries"]
+    vmem_allocated = htorch.memory_allocated() / (1024**3)
+    vmalloc_retries = htorch.memory_stats()["num_alloc_retries"]
     # global_grad_norm = model.get_global_grad_norm()
     metric_logger.log_sync(
         {
@@ -157,8 +160,8 @@ def batch_metric_log(
             "loss": loss.item(),
             "overall_throughput": overall_throughput,
             "lr": current_lr,
-            # "vmem_allocated": vmem_allocated,
-            # "vmalloc_retries": vmalloc_retries,
+            "vmem_allocated": vmem_allocated,
+            "vmalloc_retries": vmalloc_retries,
             # "num_loss_counted_tokens": int(num_loss_counted_tokens),
             "batch_size": last_batch_size,
             "total_loss": float(reduced_loss / num_loss_counted_tokens),
@@ -179,6 +182,8 @@ def train(
     metric_logger,
 ):
     model.train()
+    model = torch.compile(model, backend="hpu_backend")
+
     optimizer.zero_grad()
     global_step = 1
     global_grad_norm = None
@@ -189,8 +194,11 @@ def train(
     if LOCAL_RANK == 0:
         print(f"\033[93mNumber of samples per save: {args.save_samples}\033[0m")
 
-    # (jkunstle) TODO: implement current_epoch
+    # (jkunstle) TODO: implement epoch tracking
+
     for epoch in range(num_epochs):
+        torch.distributed.barrier()
+
         _set_sampler_epoch(
             sampler_type=args.sampler, data_loader=data_loader, epoch=epoch
         )
@@ -209,9 +217,16 @@ def train(
 
             # batch = {input_ids: ..., labels: ..., attention_mask: ...},
             # each is a torch.Tensor.
-            for k in batch:
-                batch[k] = batch[k].to(DEVICE_HPU)
+            micro_batch_size = float(torch.tensor([batch.pop("num_samples")]))
 
+            for k in batch:
+                # JKUNSTLE DEBUG - all data becomes small and fake
+                batch[k] = torch.randint(0, 1000, (128, 128)).to(DEVICE_HPU)
+                # batch[k] = batch[k].to(DEVICE_HPU)
+
+            # don't want the forward and backward passes to synchronize
+            # if we're not going to run .backward(). This is required for
+            # gradient accumulation
             no_sync = contextlib.nullcontext
             if global_step % grad_accum_steps != 0:
                 no_sync = model.no_sync
@@ -335,7 +350,8 @@ def prepare_model(
     model = convert_loss_to_reduce_sum(model, use_dolomite=False)
     model = add_noisy_embeddings(model, noise_alpha=noise_alpha)
 
-    model.gradient_checkpointing_enable()
+    # JKUNSTLE DEBUGGING
+    # model.gradient_checkpointing_enable()
 
     return model
 
@@ -393,22 +409,29 @@ def main(
 ):
     # (jkunstle) TODO: setup logger for file
 
+
     _raise_exception_for_unsupported_args(args)
+    print("VALIDATED INPUT ARGS")
+
     _setup_hpu_torch_distributed()
+    print("DISTRIBUTED INITIALIZED")
 
     # (jkunstle) TODO: try to load checkpoint
     model = load_model(model_name_or_path=model_name_or_path)
     model = prepare_model(
         model=model, tokenizer=tokenizer, noise_alpha=args.NEFTune_alpha
     )
+    print("MODEL LOADED AND PREPARED")
 
     model = setup_fsdp(
         model=model,
         sharding_strategy=args.fsdp_sharding_strategy,
         cpu_param_offload=args.cpu_offload_params_fsdp,
     )
+    print("FSDP SETUP")
 
-    optimizer = setup_optimizer(model=model, learning_rate=args.lr)
+    optimizer = setup_optimizer(model=model, learning_rate=args.learning_rate)
+    print("OPTIMIZER INITIALIZED")
 
     lr_scheduler = transformers.get_scheduler(
         name=args.lr_scheduler,
@@ -416,6 +439,7 @@ def main(
         num_warmup_steps=args.num_warmup_steps,
         num_training_steps=args.num_epochs * len(data_loader) // grad_accum_steps,
     )
+    print("LR SCHEDULER PREPARED")
 
     train(
         args=args,
