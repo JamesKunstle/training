@@ -2,7 +2,8 @@
 set -eux -o pipefail
 
 # ############### Read-only parameters ############### 
-MODEL_NAME="instructlab/granite-7b-lab"
+# MODEL_NAME="instructlab/granite-7b-lab"
+MODEL_NAME="/home/granite-7b-lab/instructlab/granite-7b-lab/"
 # gets directory of current file.
 SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 CORRECT_WORKING_DIR="${SCRIPT_DIR}/../src/instructlab/training/"
@@ -18,7 +19,7 @@ NUM_GPUS="${2:-${DEFAULT_GPUS}}"
 
 # ############### User-modifiable parameters ############### 
 # Change these as needed
-MAX_BATCH_LEN=60000
+MAX_BATCH_LEN=1000
 NUM_SAMPLES_TRAINED_ON=5000 # upper-bound on training dataset size.
 
 # ############### Test Functions ############### 
@@ -60,6 +61,8 @@ function prepare_data () {
     # then, data is trimmed to a determined length to make training
     # go faster.
     
+    local MODEL_NAME="instructlab/granite-7b-lab"
+    
     python3 data_process.py \
     --data_path="${SAMPLE_DATA_PATH}" \
     --data_output_path="${DATA_DIR}" \
@@ -69,7 +72,9 @@ function prepare_data () {
     # trim data so we only keep the first 'n' samples.
     # should be enough data for training to be meaningful but not enough
     # that training takes a large amount of time.
-    echo "$(head -"${NUM_SAMPLES_TRAINED_ON}" "${COMPUTED_DATA_PATH}")" > "${COMPUTED_DATA_PATH}"
+    sed -i "${NUM_SAMPLES_TRAINED_ON},$ d" "${COMPUTED_DATA_PATH}" 
+    # head -n "${NUM_SAMPLES_TRAINED_ON}" "${COMPUTED_DATA_PATH}" > "${COMPUTED_DATA_PATH}"
+    # echo "$(head -"${NUM_SAMPLES_TRAINED_ON}" "${COMPUTED_DATA_PATH}")" > "${COMPUTED_DATA_PATH}"
 
     echo "TRAINING ON $(wc -l "${COMPUTED_DATA_PATH}") SAMPLES"
 }
@@ -181,7 +186,7 @@ function test_standard_loop_noflashattention_nogranite () {
     --data_path="${COMPUTED_DATA_PATH}" \
     --output_dir="${CHECKPOINTS_DIR}" \
     --num_epochs=1 \
-    --effective_batch_size=128 \
+    --effective_batch_size=8 \
     --save_samples=0 \
     --checkpoint_at_epoch \
     --accelerate_full_state_at_epoch \
@@ -190,6 +195,25 @@ function test_standard_loop_noflashattention_nogranite () {
     --disable_flash_attn
     # --is_granite
 }
+    
+    
+function test_standard_loop_noflashattention_nogranite_hpu () {
+    torchrun \
+    --standalone \
+    --nproc_per_node="${NUM_GPUS}" \
+    main_ds.py \
+    --model_name_or_path="${MODEL_NAME}" \
+    --data_path="${COMPUTED_DATA_PATH}" \
+    --output_dir="${CHECKPOINTS_DIR}" \
+    --num_epochs=1 \
+    --effective_batch_size=128 \
+    --save_samples=0 \
+    --distributed_training_framework="${DISTRIB_FRAMEWORK}" \
+    --max_batch_len="${MAX_BATCH_LEN}" \
+    --disable_flash_attn \
+    --hpu
+}
+
 
 function main () {
 
@@ -202,11 +226,12 @@ function main () {
     echo "CURRENT WORKING DIRECTORY: $(pwd)"
 
     prepare_data
-    test_standard_loop_noflashattention_nogranite
-    _cleanup_saved_checkpoints
-    test_standard_loop_nongranite
-    _cleanup_saved_checkpoints
-    test_standard_loop
+    test_standard_loop_noflashattention_nogranite_hpu
+    # test_standard_loop_noflashattention_nogranite
+    # _cleanup_saved_checkpoints
+    # test_standard_loop_nongranite
+    # _cleanup_saved_checkpoints
+    # test_standard_loop
 }
 
 main

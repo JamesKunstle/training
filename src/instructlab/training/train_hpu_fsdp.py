@@ -12,6 +12,9 @@ import time
 
 # Third Party
 os.environ["PT_HPU_LAZY_MODE"] = "0"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+from optimum.habana.transformers.models.llama import GaudiLlamaForCausalLM
 import habana_frameworks.torch as htorch
 import habana_frameworks.torch.distributed.hccl
 
@@ -20,7 +23,7 @@ from torch.distributed.fsdp import BackwardPrefetch, CPUOffload
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from tqdm import tqdm
+from tqdm import tqdm, trange
 import tokenizers
 import torch
 import transformers
@@ -85,7 +88,9 @@ def setup_fsdp(model: torch.nn.Module, sharding_strategy: str, cpu_param_offload
         sharding_strategy=ShardingStrategy[sharding_strategy],
         device_id=torch.device("hpu", torch.hpu.current_device()),
         cpu_offload=CPUOffload(offload_params=cpu_param_offload),
+        use_orig_params=True,
     )
+
 
     return model
 
@@ -146,8 +151,8 @@ def batch_metric_log(
 
     elapsed_time = time.time() - start_time
     overall_throughput = args.samples_per_gpu * WORLD_SIZE / elapsed_time
-    # vmem_allocated = htorch.memory_allocated() / (1024**3)
-    # vmalloc_retries = htorch.memory_stats()["num_alloc_retries"]
+    vmem_allocated = htorch.memory_allocated() / (1024**3)
+    vmalloc_retries = htorch.memory_stats()["num_alloc_retries"]
     # global_grad_norm = model.get_global_grad_norm()
     metric_logger.log_sync(
         {
@@ -157,8 +162,8 @@ def batch_metric_log(
             "loss": loss.item(),
             "overall_throughput": overall_throughput,
             "lr": current_lr,
-            # "vmem_allocated": vmem_allocated,
-            # "vmalloc_retries": vmalloc_retries,
+            "vmem_allocated": vmem_allocated,
+            "vmalloc_retries": vmalloc_retries,
             # "num_loss_counted_tokens": int(num_loss_counted_tokens),
             "batch_size": last_batch_size,
             "total_loss": float(reduced_loss / num_loss_counted_tokens),
@@ -179,6 +184,8 @@ def train(
     metric_logger,
 ):
     model.train()
+    model = torch.compile(model, backend="hpu_backend")
+
     optimizer.zero_grad()
     global_step = 1
     global_grad_norm = None
@@ -189,8 +196,11 @@ def train(
     if LOCAL_RANK == 0:
         print(f"\033[93mNumber of samples per save: {args.save_samples}\033[0m")
 
-    # (jkunstle) TODO: implement current_epoch
+    # (jkunstle) TODO: implement epoch tracking
+
     for epoch in range(num_epochs):
+        torch.distributed.barrier()
+
         _set_sampler_epoch(
             sampler_type=args.sampler, data_loader=data_loader, epoch=epoch
         )
@@ -209,9 +219,16 @@ def train(
 
             # batch = {input_ids: ..., labels: ..., attention_mask: ...},
             # each is a torch.Tensor.
-            for k in batch:
-                batch[k] = batch[k].to(DEVICE_HPU)
+            micro_batch_size = float(torch.tensor([batch.pop("num_samples")]))
 
+            for k in batch:
+                # JKUNSTLE DEBUG - all data becomes small and fake
+                batch[k] = torch.randint(0, 1000, (128, 128)).to(DEVICE_HPU)
+                # batch[k] = batch[k].to(DEVICE_HPU)
+
+            # don't want the forward and backward passes to synchronize
+            # if we're not going to run .backward(). This is required for
+            # gradient accumulation
             no_sync = contextlib.nullcontext
             if global_step % grad_accum_steps != 0:
                 no_sync = model.no_sync
@@ -332,10 +349,11 @@ def prepare_model(
         token_list=["bos_token_id", "eos_token_id", "pad_tok_id"],
     )
 
-    model = convert_loss_to_reduce_sum(model, use_dolomite=False)
-    model = add_noisy_embeddings(model, noise_alpha=noise_alpha)
+    # JKUNSTLE DEBUGGING - removing to minimize differences in model
+    # model = convert_loss_to_reduce_sum(model, use_dolomite=False)
+    # model = add_noisy_embeddings(model, noise_alpha=noise_alpha)
 
-    model.gradient_checkpointing_enable()
+    # model.gradient_checkpointing_enable()
 
     return model
 
@@ -350,6 +368,7 @@ def load_model(model_name_or_path: str) -> torch.nn.Module:
         pretrained_model_name_or_path=model_name_or_path, torch_dtype=torch.bfloat16
     )
 
+    # JKUNSTLE_DEBUG removed for GaudiLlamaForCausalLM
     if model.__class__.__name__ not in constants.SUPPORTED_MODEL_ARCHITECTURES:
         raise RuntimeError(
             f"Model class name: {model.__class__.__name__} is not supported."
@@ -383,6 +402,55 @@ def _raise_exception_for_unsupported_args(args) -> None:
         )
 
 
+def get_rand_NxM_tensor(batch_size: int=128, seq_len: int=1024):
+    return torch.randint(0, 2000, (batch_size, seq_len))
+
+def get_ones_NxM_tensor(batch_size: int=128, seq_len: int=1024):
+    return torch.ones(batch_size, seq_len)
+
+def _train_test(rank: int, model: torch.nn.Module, optim: torch.optim.AdamW, lr_scheduler, data_loader: torch.utils.data.DataLoader, iterations: int = 10):
+
+    model = torch.compile(model, backend="hpu_backend")
+
+
+    for batch in data_loader:
+
+        # values from dataloader that we use for bookkeeping; shouldn't be sent through model forward.
+        dist_shared_buffer = batch.pop("num_loss_counted_tokens")
+        micro_batch_size = batch.pop("num_samples")
+
+        for k in batch:
+            print(batch[k].shape)
+            batch[k] = batch[k].to(DEVICE_HPU)
+        
+        # if inputs and labels are the same, model can learn to match 1:1 maybe.
+        # rand_input = get_rand_NxM_tensor(batch_size=4, seq_len=512)
+        # rand_labels = rand_input.clone()
+
+        # ones_mask = get_ones_NxM_tensor(batch_size=4, seq_len=512)
+
+        # in_data = {
+        #     "input_ids": rand_input.to("hpu"),
+        #     "labels": rand_labels.to("hpu"),
+        #     "attention_mask": ones_mask.to("hpu")
+        # }
+        # out = model(**in_data)
+        out = model(**batch)
+        loss = out.loss
+        # print(loss)
+        loss.backward()
+
+        if rank == 0:
+            print(htorch.hpu.memory_summary())
+
+        optim.step()
+        # lr_scheduler.step()
+        optim.zero_grad()
+
+
+    # cleanup()
+    print("All done")
+
 def main(
     args,
     model_name_or_path: str,
@@ -393,22 +461,29 @@ def main(
 ):
     # (jkunstle) TODO: setup logger for file
 
+
     _raise_exception_for_unsupported_args(args)
+    print("VALIDATED INPUT ARGS")
+
     _setup_hpu_torch_distributed()
+    print("DISTRIBUTED INITIALIZED")
 
     # (jkunstle) TODO: try to load checkpoint
     model = load_model(model_name_or_path=model_name_or_path)
     model = prepare_model(
         model=model, tokenizer=tokenizer, noise_alpha=args.NEFTune_alpha
     )
+    print("MODEL LOADED AND PREPARED")
 
     model = setup_fsdp(
         model=model,
         sharding_strategy=args.fsdp_sharding_strategy,
         cpu_param_offload=args.cpu_offload_params_fsdp,
     )
+    print("FSDP SETUP")
 
-    optimizer = setup_optimizer(model=model, learning_rate=args.lr)
+    optimizer = setup_optimizer(model=model, learning_rate=args.learning_rate)
+    print("OPTIMIZER INITIALIZED")
 
     lr_scheduler = transformers.get_scheduler(
         name=args.lr_scheduler,
@@ -416,14 +491,17 @@ def main(
         num_warmup_steps=args.num_warmup_steps,
         num_training_steps=args.num_epochs * len(data_loader) // grad_accum_steps,
     )
+    print("LR SCHEDULER PREPARED")
 
-    train(
-        args=args,
-        model=model,
-        optimizer=optimizer,
-        lr_scheduler=lr_scheduler,
-        metric_logger=metric_logger,
-        data_loader=data_loader,
-        grad_accum_steps=grad_accum_steps,
-        num_epochs=args.num_epochs,
-    )
+    _train_test(rank=LOCAL_RANK, model=model, optim=optimizer, lr_scheduler=lr_scheduler, data_loader=data_loader)
+
+    # train(
+    #     args=args,
+    #     model=model,
+    #     optimizer=optimizer,
+    #     lr_scheduler=lr_scheduler,
+    #     metric_logger=metric_logger,
+    #     data_loader=data_loader,
+    #     grad_accum_steps=grad_accum_steps,
+    #     num_epochs=args.num_epochs,
+    # )
