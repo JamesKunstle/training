@@ -228,3 +228,8 @@ class TrainingArgs(BaseModel):
         default=False,
         description="Whether to use Liger kernels for training.",
     )
+
+    disable_distributed_sampler_fallback: bool = Field(
+        default=False,
+        description="Disables fallback use of DistributedSampler in cases when MultipackDistributedSampler might fail.",
+    )

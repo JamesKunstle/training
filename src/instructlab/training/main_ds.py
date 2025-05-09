@@ -626,12 +626,18 @@ def main(args):
         seed=args.seed,
     )
     if len(train_loader) == 0:
-        # this happens sometimes when we have more GPUs than data to process. In this case
-        # we should either alert the user to switch samplers, or do it automatically and
-        # warn them about it happening
         print(
-            "\033[93mThe dataset is too small for multipack to distribute all of the samples across GPUs. Falling back to the distributed sampler!\033[0m"
+            "\033[93mMultipackDistributedSampler failed. Dataset may have been too small to distibute over all available GPUs.\033[0m"
         )
+
+        # default behavior is to fallback to suboptimal sampler.
+        # if this isn't desirable, user can cancel the behavior.
+        if args.disable_distributed_sampler_fallback:
+            raise RuntimeError(
+                "\033[93mFallback to torch DistributedSampler was disabled.\033[0m"
+            )
+
+        print("\033[93mFalling back to torch DistributedSampler.\033[0m")
         args.sampler = "distributed"
         train_loader = setup_dataloader(
             dataset,
@@ -825,6 +831,9 @@ def run_training(torch_args: TorchrunArgs, train_args: TrainingArgs) -> None:
     if train_args.keep_last_checkpoint_only:
         command.append("--keep_last_checkpoint_only")
 
+    if train_args.disable_distributed_sampler_fallback:
+        command.append("--disable_distributed_sampler_fallback")
+
     print(f"\033[92mRunning training command as subprocess: {' '.join(command)}\033[0m")
     process = None
     interrupt: KeyboardInterrupt | Exception | None = None
@@ -1014,6 +1023,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Use Liger kernels for training.",
     )
+
+    parser.add_argument(
+        "--disable_distributed_sampler_fallback",
+        action="store_true",
+        help="Disables fallback use of DistributedSampler in cases when MultipackDistributedSampler might fail.",
+    )
+
     args = parser.parse_args()
     set_random_seed(args.seed)
     main(args)
